@@ -1,0 +1,198 @@
+// main.go
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+	// --- Configuration from Environment Variables ---
+	downstreamServiceURL string
+	smeeChannelURL       string
+
+	// --- Prometheus Metrics ---
+	forwardAttempts = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "smee_events_relayed_total",
+			Help: "Total number of regular events relayed by the sidecar.",
+		},
+	)
+
+	// --- Shared State for Health Checks ---
+	// A thread-safe map to store unique IDs from received health check events
+	healthCheckIDs = make(map[string]bool)
+	mutex          = &sync.Mutex{}
+)
+
+// HealthCheckPayload defines the structure of our self-test event
+type HealthCheckPayload struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+}
+
+// forwardHandler is the main logic for the relay server
+func forwardHandler(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading request body: %v", err)
+		http.Error(w, "cannot read request body", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	// --- Check if the payload is a health check event ---
+	var healthCheck HealthCheckPayload
+	// We only attempt to unmarshal if the content-type is JSON, to be safer
+	if r.Header.Get("Content-Type") == "application/json" {
+		// We check if the body can be decoded into our health check struct
+		// AND if it contains our specific "type" field.
+		if json.Unmarshal(body, &healthCheck) == nil && healthCheck.Type == "health-check" {
+			// It's a health check. Handle it and exit.
+			mutex.Lock()
+			healthCheckIDs[healthCheck.ID] = true
+			mutex.Unlock()
+			log.Printf("Received health check event with ID: %s", healthCheck.ID)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Health check received"))
+			return // Crucially, we return here and do nothing else.
+		}
+	}
+
+	// --- If we've reached this point, it's a regular event ---
+	forwardAttempts.Inc() // Increment counter for regular events
+	log.Printf("Relaying regular event to: %s%s", downstreamServiceURL, r.URL.Path)
+
+	// Create a new request to the downstream service
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, downstreamServiceURL+r.URL.String(), bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Error creating proxy request: %v", err)
+		http.Error(w, "error creating proxy request", http.StatusInternalServerError)
+		return
+	}
+
+	// Copy headers from original request
+	proxyReq.Header = make(http.Header)
+	for h, val := range r.Header {
+		proxyReq.Header[h] = val
+	}
+
+	// Send the request
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		log.Printf("Error forwarding request: %v", err)
+		http.Error(w, "error forwarding request", http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response back to the original caller (smee-client)
+	w.WriteHeader(resp.StatusCode)
+	for h, val := range resp.Header {
+		w.Header()[h] = val
+	}
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("Error writing response body: %v", err)
+	}
+}
+
+// healthCheckHandler orchestrates the self-test loop
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	testID := uuid.New().String()
+	payload := HealthCheckPayload{Type: "health-check", ID: testID}
+	payloadBytes, _ := json.Marshal(payload)
+
+	// 1. Post the test event to the Smee server
+	req, err := http.NewRequestWithContext(context.Background(), "POST", smeeChannelURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		log.Printf("Health check failed: could not create request: %v", err)
+		http.Error(w, "Health check failed", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	if _, err := client.Do(req); err != nil {
+		log.Printf("Health check failed: could not post to Smee server: %v", err)
+		http.Error(w, "Cannot connect to Smee server", http.StatusServiceUnavailable)
+		return
+	}
+
+	// 2. Wait up to 7 seconds to see if our event was received by the forwarder
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done(): // Timeout reached
+			log.Printf("Health check FAILED for ID: %s. Event not received in time.", testID)
+			http.Error(w, "Event relay loop is broken", http.StatusServiceUnavailable)
+			return
+		default:
+			mutex.Lock()
+			found := healthCheckIDs[testID]
+			if found {
+				delete(healthCheckIDs, testID) // Clean up
+			}
+			mutex.Unlock()
+
+			if found {
+				log.Printf("Health check PASSED for ID: %s", testID)
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("OK"))
+				return
+			}
+			time.Sleep(100 * time.Millisecond) // Wait briefly before checking again
+		}
+	}
+}
+
+func main() {
+	log.Println("Starting Smee instrumentation sidecar...")
+
+	// --- Load Configuration ---
+	downstreamServiceURL = os.Getenv("DOWNSTREAM_SERVICE_URL")
+	smeeChannelURL = os.Getenv("SMEE_CHANNEL_URL")
+	if downstreamServiceURL == "" || smeeChannelURL == "" {
+		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL and SMEE_CHANNEL_URL environment variables must be set.")
+	}
+
+	// --- Register Prometheus Metrics ---
+	prometheus.MustRegister(forwardAttempts)
+
+	// --- Start Relay Server (on port 8080) ---
+	relayMux := http.NewServeMux()
+	relayMux.HandleFunc("/", forwardHandler)
+	go func() {
+		log.Println("Relay server listening on :8080")
+		if err := http.ListenAndServe(":8080", relayMux); err != nil {
+			log.Fatalf("FATAL: Relay server failed: %v", err)
+		}
+	}()
+
+	// --- Start Management Server (on port 9100) ---
+	mgmtMux := http.NewServeMux()
+	mgmtMux.Handle("/metrics", promhttp.Handler())
+	mgmtMux.HandleFunc("/healthz", healthCheckHandler)
+	go func() {
+		log.Println("Management server (metrics, healthz) listening on :9100")
+		if err := http.ListenAndServe(":9100", mgmtMux); err != nil {
+			log.Fatalf("FATAL: Management server failed: %v", err)
+		}
+	}()
+
+	// Keep the main goroutine alive
+	select {}
+}
