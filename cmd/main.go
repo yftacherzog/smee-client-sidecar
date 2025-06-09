@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -33,6 +35,9 @@ var (
 	// --- Shared State for Health Checks ---
 	healthCheckIDs = make(map[string]bool)
 	mutex          = &sync.Mutex{}
+
+	// We will initialize this in main() after parsing the downstream URL.
+	proxy *httputil.ReverseProxy
 )
 
 // HealthCheckPayload defines the structure of our self-test event
@@ -41,8 +46,11 @@ type HealthCheckPayload struct {
 	ID   string `json:"id"`
 }
 
-// forwardHandler remains the same as the last correct version
+// forwardHandler is now much simpler.
 func forwardHandler(w http.ResponseWriter, r *http.Request) {
+	// We still need to check for our internal health check events first.
+	// Since this requires reading the body, we'll read it here and then
+	// pass it along to the proxy if it's a regular event.
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("Error reading request body: %v", err)
@@ -54,6 +62,7 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	var healthCheck HealthCheckPayload
 	if r.Header.Get("Content-Type") == "application/json" {
 		if json.Unmarshal(body, &healthCheck) == nil && healthCheck.Type == "health-check" {
+			// It's a health check. Handle it and exit.
 			mutex.Lock()
 			healthCheckIDs[healthCheck.ID] = true
 			mutex.Unlock()
@@ -64,37 +73,15 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If we got here, it's a regular event.
 	forwardAttempts.Inc()
-	log.Printf("Relaying regular event to: %s%s", downstreamServiceURL, r.URL.Path)
+	log.Printf("Relaying regular event via ReverseProxy to downstream service")
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, downstreamServiceURL+r.URL.String(), bytes.NewReader(body))
-	if err != nil {
-		log.Printf("Error creating proxy request: %v", err)
-		http.Error(w, "error creating proxy request", http.StatusInternalServerError)
-		return
-	}
+	// We need to put the body back on the request for the proxy to read it.
+	r.Body = io.NopCloser(bytes.NewReader(body))
 
-	proxyReq.Header = make(http.Header)
-	for h, val := range r.Header {
-		proxyReq.Header[h] = val
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		log.Printf("Error forwarding request: %v", err)
-		http.Error(w, "error forwarding request", http.StatusServiceUnavailable)
-		return
-	}
-	defer resp.Body.Close()
-
-	w.WriteHeader(resp.StatusCode)
-	for h, val := range resp.Header {
-		w.Header()[h] = val
-	}
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("Error writing response body: %v", err)
-	}
+	// --- Let the ReverseProxy do all the hard work ---
+	proxy.ServeHTTP(w, r)
 }
 
 // runHealthCheckLoop has the corrected loop structure
@@ -178,11 +165,19 @@ func main() {
 	log.Println("Starting Smee instrumentation sidecar...")
 
 	// --- Load Configuration ---
-	downstreamServiceURL = os.Getenv("DOWNSTREAM_SERVICE_URL")
+	downstreamServiceURL := os.Getenv("DOWNSTREAM_SERVICE_URL") // Make it a local variable
 	smeeChannelURL = os.Getenv("SMEE_CHANNEL_URL")
 	if downstreamServiceURL == "" || smeeChannelURL == "" {
 		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL and SMEE_CHANNEL_URL environment variables must be set.")
 	}
+
+	// --- NEW: Initialize the ReverseProxy ---
+	downstreamURL, err := url.Parse(downstreamServiceURL)
+	if err != nil {
+		log.Fatalf("FATAL: Could not parse DOWNSTREAM_SERVICE_URL: %v", err)
+	}
+	proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
+	// --- End of new section ---
 
 	// --- Register Prometheus Metrics ---
 	prometheus.MustRegister(forwardAttempts)
@@ -190,7 +185,7 @@ func main() {
 	// --- Start the background health check loop ---
 	go runHealthCheckLoop()
 
-	// --- Start Relay Server (on port 8080) ---
+	// --- Start Relay Server ---
 	relayMux := http.NewServeMux()
 	relayMux.HandleFunc("/", forwardHandler)
 	go func() {
@@ -200,7 +195,7 @@ func main() {
 		}
 	}()
 
-	// --- Start Management Server (on port 9100) ---
+	// --- Start Management Server ---
 	mgmtMux := http.NewServeMux()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
 	go func() {

@@ -29,9 +29,9 @@ WORKDIR /
 COPY --from=builder /opt/app-root/smee-client-sidecar .
 COPY LICENSE /licenses/
 # TODO: figure out proper ca-trust solution
-USER 0
-ADD --chown=root:root --chmod=644 data/ca-trust/* /etc/pki/ca-trust/source/anchors
-RUN /usr/bin/update-ca-trust
+# USER 0
+# ADD --chown=root:root --chmod=644 data/ca-trust/* /etc/pki/ca-trust/source/anchors
+# RUN /usr/bin/update-ca-trust
 USER 65532:65532
 
 # It is mandatory to set these labels
